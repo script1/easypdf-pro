@@ -49,7 +49,11 @@ export default function Home() {
     setActiveTool(id);
     setFiles([]);
     setResult({ message: '', downloadUrl: '', status: 'idle' });
-    setStage('upload');
+    if (id === 'Merge PDF') {
+      setStage('upload');
+    } else {
+      setStage('upload');
+    }
   };
 
   const handleFileSelect = (file: File | null) => {
