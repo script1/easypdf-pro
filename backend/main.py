@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
-import shutil
 import uuid
 from typing import List
 import zipfile
@@ -21,7 +20,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 async def cleanup_old_files():
     while True:
-        await asyncio.sleep(1800)  # Run every 30 minutes
+        await asyncio.sleep(1800)
         now = time.time()
         try:
             for filename in os.listdir(UPLOAD_DIR):
@@ -83,7 +82,7 @@ def read_root():
     return {"message": "EasyPDF Pro Backend is Running", "version": "2.0"}
 
 
-# ─────────────────────────── UPLOAD ───────────────────────────
+# UPLOAD
 
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
@@ -108,7 +107,7 @@ async def upload_file(file: UploadFile = File(...)):
     }
 
 
-# ─────────────────────────── MERGE ────────────────────────────
+# MERGE
 
 @app.post("/merge/")
 async def merge_pdfs(files: List[UploadFile] = File(...)):
@@ -123,7 +122,6 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
             data = await read_file_bytes(file)
             if not is_valid_pdf(data):
                 raise HTTPException(status_code=400, detail=f"{file.filename} is not a valid PDF.")
-
             temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.pdf")
             with open(temp_path, "wb") as f:
                 f.write(data)
@@ -156,7 +154,7 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
     }
 
 
-# ─────────────────────────── SPLIT ────────────────────────────
+# SPLIT
 
 @app.post("/split/")
 async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
@@ -233,14 +231,13 @@ async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
             pass
 
 
-# ─────────────────────── PDF → WORD ───────────────────────────
+# PDF to WORD - accepts file_id as query param (original behavior) OR file upload
 
 @app.post("/convert/pdf-to-word/")
 async def convert_pdf_to_word(
-    file_id: str = Form(None),
+    file_id: str = None,
     file: UploadFile = File(None),
 ):
-    """Accepts either a previously uploaded file_id OR a direct file upload."""
     pdf_path = None
     temp_created = False
 
@@ -286,7 +283,7 @@ async def convert_pdf_to_word(
     }
 
 
-# ─────────────────────── PDF → JPG ────────────────────────────
+# PDF to JPG
 
 @app.post("/convert/pdf-to-jpg/")
 async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(None)):
@@ -363,7 +360,7 @@ async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(Non
             pass
 
 
-# ──────────────────── IMAGES → PDF ────────────────────────────
+# IMAGES to PDF
 
 @app.post("/convert/images-to-pdf/")
 async def images_to_pdf(files: List[UploadFile] = File(...)):
@@ -377,12 +374,11 @@ async def images_to_pdf(files: List[UploadFile] = File(...)):
 
     try:
         doc = fitz.open()
-
         for file in files:
             if not is_valid_image(file.content_type or ""):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"{file.filename} is not a supported image (JPEG, PNG, GIF, WebP, BMP).",
+                    detail=f"{file.filename} is not a supported image.",
                 )
             data = await read_file_bytes(file)
             ext = os.path.splitext(file.filename or "")[1] or ".jpg"
@@ -394,7 +390,6 @@ async def images_to_pdf(files: List[UploadFile] = File(...)):
             img_doc = fitz.open(temp_path)
             pdf_bytes = img_doc.convert_to_pdf()
             img_doc.close()
-
             img_pdf = fitz.open("pdf", pdf_bytes)
             doc.insert_pdf(img_pdf)
             img_pdf.close()
@@ -420,7 +415,7 @@ async def images_to_pdf(files: List[UploadFile] = File(...)):
     }
 
 
-# ─────────────────────── PROTECT ──────────────────────────────
+# PROTECT
 
 @app.post("/protect/")
 async def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
@@ -461,7 +456,7 @@ async def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
     }
 
 
-# ─────────────────────── UNLOCK ───────────────────────────────
+# UNLOCK
 
 @app.post("/unlock/")
 async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
@@ -483,14 +478,11 @@ async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
             result = reader.decrypt(password)
             if not result:
                 raise HTTPException(status_code=401, detail="Incorrect password.")
-
         writer = PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
-
         with open(output_path, "wb") as f:
             writer.write(f)
-
     except HTTPException:
         raise
     except Exception as e:
@@ -508,7 +500,7 @@ async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
     }
 
 
-# ─────────────────────── COMPRESS ─────────────────────────────
+# COMPRESS
 
 @app.post("/compress/")
 async def compress_pdf(file: UploadFile = File(...)):
@@ -549,7 +541,7 @@ async def compress_pdf(file: UploadFile = File(...)):
     }
 
 
-# ─────────────────────── WATERMARK ────────────────────────────
+# WATERMARK
 
 @app.post("/watermark/")
 async def add_watermark(
@@ -562,8 +554,6 @@ async def add_watermark(
         raise HTTPException(status_code=400, detail="Invalid PDF file.")
     if not text.strip():
         raise HTTPException(status_code=400, detail="Watermark text is required.")
-
-    opacity = max(0.1, min(1.0, opacity))
 
     task_id = str(uuid.uuid4())
     input_path = os.path.join(UPLOAD_DIR, f"wm_input_{task_id}.pdf")
@@ -602,7 +592,7 @@ async def add_watermark(
     }
 
 
-# ─────────────────────── ROTATE ───────────────────────────────
+# ROTATE
 
 @app.post("/rotate/")
 async def rotate_pdf(
@@ -659,13 +649,13 @@ async def rotate_pdf(
             pass
 
     return {
-        "message": f"Rotation by {angle}° successful",
+        "message": f"Rotation by {angle} degrees successful",
         "rotated_filename": output_filename,
         "download_url": f"/download/{output_filename}",
     }
 
 
-# ─────────────────────── DELETE PAGES ─────────────────────────
+# DELETE PAGES
 
 @app.post("/delete-pages/")
 async def delete_pages(
@@ -726,7 +716,7 @@ async def delete_pages(
     }
 
 
-# ─────────────────────── REORDER PAGES ────────────────────────
+# REORDER PAGES
 
 @app.post("/reorder-pages/")
 async def reorder_pages(
@@ -784,7 +774,7 @@ async def reorder_pages(
     }
 
 
-# ─────────────────────── EXTRACT TEXT ─────────────────────────
+# EXTRACT TEXT
 
 @app.post("/extract-text/")
 async def extract_text(file: UploadFile = File(...)):
@@ -832,7 +822,7 @@ async def extract_text(file: UploadFile = File(...)):
     }
 
 
-# ─────────────────────── DOWNLOAD ─────────────────────────────
+# DOWNLOAD
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
