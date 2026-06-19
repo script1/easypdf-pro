@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 import os
 import shutil
 import uuid
@@ -9,143 +10,140 @@ import zipfile
 from pypdf import PdfWriter, PdfReader
 import fitz  # PyMuPDF
 from pdf2docx import Converter
+import asyncio
+import time
 
-app = FastAPI()
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+FILE_EXPIRY_SECONDS = 3600  # 1 hour
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Configure CORS to allow any origin (for public access)
-origins = ["*"]
+
+async def cleanup_old_files():
+    while True:
+        await asyncio.sleep(1800)  # Run every 30 minutes
+        now = time.time()
+        try:
+            for filename in os.listdir(UPLOAD_DIR):
+                file_path = os.path.join(UPLOAD_DIR, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        if now - os.path.getmtime(file_path) > FILE_EXPIRY_SECONDS:
+                            os.remove(file_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(cleanup_old_files())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def is_valid_pdf(data: bytes) -> bool:
+    return data[:5] == b'%PDF-'
+
+
+def is_valid_image(content_type: str) -> bool:
+    return content_type in {
+        "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"
+    }
+
+
+async def read_file_bytes(file: UploadFile) -> bytes:
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)}MB.",
+        )
+    return data
+
+
+app = FastAPI(title="EasyPDF Pro API", version="2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 
 @app.get("/")
 def read_root():
-    return {"message": "EasyPDF Backend is Running"}
+    return {"message": "EasyPDF Pro Backend is Running", "version": "2.0"}
 
+
+# ─────────────────────────── UPLOAD ───────────────────────────
 
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a file to the server.
-    Validates that the file is a PDF.
-    """
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
 
     file_id = str(uuid.uuid4())
-    file_extension = os.path.splitext(file.filename)[1]
-    saved_filename = f"{file_id}{file_extension}"
-    file_path = os.path.join(UPLOAD_DIR, saved_filename)
+    ext = os.path.splitext(file.filename or "")[1] or ".pdf"
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
 
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
+    with open(file_path, "wb") as f:
+        f.write(data)
 
     return {
         "filename": file.filename,
         "file_id": file_id,
-        "content_type": file.content_type,
-        "path": file_path,
         "message": "File uploaded successfully",
+        "download_url": f"/download/{file_id}{ext}",
     }
 
 
-@app.post("/convert/pdf-to-word/")
-async def convert_pdf_to_word(file_id: str):
-    """
-    Convert a previously uploaded PDF file to Word (.docx).
-    """
-    files = os.listdir(UPLOAD_DIR)
-    target_file = None
-    for f in files:
-        if f.startswith(file_id) and f.endswith(".pdf"):
-            target_file = f
-            break
-
-    if not target_file:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    pdf_path = os.path.join(UPLOAD_DIR, target_file)
-    docx_filename = f"{file_id}.docx"
-    docx_path = os.path.join(UPLOAD_DIR, docx_filename)
-
-    try:
-        cv = Converter(pdf_path)
-        cv.convert(docx_path, start=0, end=None)
-        cv.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
-
-    return {
-        "message": "Conversion successful",
-        "docx_filename": docx_filename,
-        "download_url": f"/download/{docx_filename}",
-    }
-
+# ─────────────────────────── MERGE ────────────────────────────
 
 @app.post("/merge/")
 async def merge_pdfs(files: List[UploadFile] = File(...)):
-    """
-    Merge multiple PDF files into one.
-    """
-    if not files or len(files) < 2:
-        raise HTTPException(
-            status_code=400, detail="Please upload at least 2 PDF files."
-        )
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Please upload at least 2 PDF files.")
 
     merger = PdfWriter()
     temp_files = []
-    input_streams = []
 
     try:
         for file in files:
-            if file.content_type != "application/pdf":
-                raise HTTPException(
-                    status_code=400, detail=f"File {file.filename} is not a PDF."
-                )
+            data = await read_file_bytes(file)
+            if not is_valid_pdf(data):
+                raise HTTPException(status_code=400, detail=f"{file.filename} is not a valid PDF.")
 
-            temp_id = str(uuid.uuid4())
-            temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.pdf")
-
-            with open(temp_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
+            temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.pdf")
+            with open(temp_path, "wb") as f:
+                f.write(data)
             temp_files.append(temp_path)
 
-            f = open(temp_path, "rb")
-            input_streams.append(f)
-            merger.append(f)
+        for path in temp_files:
+            merger.append(path)
 
         merged_filename = f"merged_{uuid.uuid4()}.pdf"
         merged_path = os.path.join(UPLOAD_DIR, merged_filename)
+        with open(merged_path, "wb") as f:
+            merger.write(f)
 
-        with open(merged_path, "wb") as f_out:
-            merger.write(f_out)
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")
     finally:
-        for f in input_streams:
-            try:
-                f.close()
-            except Exception:
-                pass
-
+        merger.close()
         for path in temp_files:
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                os.remove(path)
             except Exception:
                 pass
 
@@ -156,80 +154,52 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
     }
 
 
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    file_path = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, filename=filename)
-
+# ─────────────────────────── SPLIT ────────────────────────────
 
 @app.post("/split/")
 async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
-    """
-    Split a PDF into multiple PDF files. Support page selection.
-    """
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
 
     task_id = str(uuid.uuid4())
-    input_filename = f"split_input_{task_id}.pdf"
-    input_path = os.path.join(UPLOAD_DIR, input_filename)
+    input_path = os.path.join(UPLOAD_DIR, f"split_input_{task_id}.pdf")
+    with open(input_path, "wb") as f:
+        f.write(data)
 
-    try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
-
+    generated_files = []
     zip_filename = f"split_{task_id}.zip"
     zip_path = os.path.join(UPLOAD_DIR, zip_filename)
 
-    generated_files = []
-
     try:
-        selected_pages = []
-        if pages:
-            try:
-                selected_pages = [
-                    int(p.strip()) for p in pages.split(",") if p.strip().isdigit()
-                ]
-            except ValueError:
-                pass
-
         with open(input_path, "rb") as f_in:
             reader = PdfReader(f_in)
             total_pages = len(reader.pages)
 
-            if total_pages < 1:
-                raise HTTPException(status_code=400, detail="PDF has no pages.")
-
+            selected_pages = []
+            if pages:
+                selected_pages = [
+                    int(p.strip())
+                    for p in pages.split(",")
+                    if p.strip().isdigit() and 0 <= int(p.strip()) < total_pages
+                ]
             if not selected_pages:
                 selected_pages = list(range(total_pages))
 
             pdf_paths = []
-
             for i in selected_pages:
-                if i < 0 or i >= total_pages:
-                    continue
-
                 writer = PdfWriter()
                 writer.add_page(reader.pages[i])
-
-                page_filename = f"page_{i+1}.pdf"
+                page_filename = f"page_{i + 1}.pdf"
                 page_path = os.path.join(UPLOAD_DIR, f"{task_id}_{page_filename}")
-
                 with open(page_path, "wb") as f_out:
                     writer.write(f_out)
-
                 generated_files.append(page_path)
                 pdf_paths.append((page_path, page_filename))
 
-            # Decide on output format
             if len(pdf_paths) == 1:
                 single_path, single_name = pdf_paths[0]
                 generated_files.remove(single_path)
-
                 return {
                     "message": "Split successful",
                     "zip_filename": single_name,
@@ -239,52 +209,78 @@ async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
                 with zipfile.ZipFile(zip_path, "w") as zipf:
                     for p_path, p_name in pdf_paths:
                         zipf.write(p_path, arcname=p_name)
-
                 return {
                     "message": "Split successful",
                     "zip_filename": zip_filename,
                     "download_url": f"/download/{zip_filename}",
                 }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error splitting PDF: {e}")
         raise HTTPException(status_code=500, detail=f"Split failed: {str(e)}")
     finally:
         for path in generated_files:
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                os.remove(path)
             except Exception:
                 pass
-
         try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
+            os.remove(input_path)
         except Exception:
             pass
 
 
-@app.post("/convert/pdf-to-jpg/")
-async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(None)):
-    """
-    Convert a PDF into JPG images. Support page selection.
-    """
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+# ─────────────────────── PDF → WORD ───────────────────────────
+
+@app.post("/convert/pdf-to-word/")
+async def convert_pdf_to_word(file: UploadFile = File(...)):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
 
     task_id = str(uuid.uuid4())
-    input_filename = f"jpg_input_{task_id}.pdf"
-    input_path = os.path.join(UPLOAD_DIR, input_filename)
+    pdf_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
+    docx_filename = f"word_{task_id}.docx"
+    docx_path = os.path.join(UPLOAD_DIR, docx_filename)
+
+    with open(pdf_path, "wb") as f:
+        f.write(data)
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        cv = Converter(pdf_path)
+        cv.convert(docx_path, start=0, end=None)
+        cv.close()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    finally:
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
+
+    return {
+        "message": "Conversion successful",
+        "docx_filename": docx_filename,
+        "download_url": f"/download/{docx_filename}",
+    }
+
+
+# ─────────────────────── PDF → JPG ────────────────────────────
+
+@app.post("/convert/pdf-to-jpg/")
+async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(None)):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"jpg_input_{task_id}.pdf")
+    with open(input_path, "wb") as f:
+        f.write(data)
 
     zip_filename = f"images_{task_id}.zip"
     zip_path = os.path.join(UPLOAD_DIR, zip_filename)
-
     generated_files = []
 
     try:
@@ -293,27 +289,20 @@ async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(Non
 
         selected_pages = []
         if pages:
-            try:
-                selected_pages = [
-                    int(p.strip()) for p in pages.split(",") if p.strip().isdigit()
-                ]
-            except ValueError:
-                pass
-
+            selected_pages = [
+                int(p.strip())
+                for p in pages.split(",")
+                if p.strip().isdigit() and 0 <= int(p.strip()) < total_pages
+            ]
         if not selected_pages:
             selected_pages = list(range(total_pages))
 
         img_paths = []
-
         for i in selected_pages:
-            if i < 0 or i >= total_pages:
-                continue
-
             page = doc[i]
             pix = page.get_pixmap(dpi=150)
-            img_filename = f"page_{i+1}.jpg"
+            img_filename = f"page_{i + 1}.jpg"
             img_path = os.path.join(UPLOAD_DIR, f"{task_id}_{img_filename}")
-
             pix.save(img_path)
             generated_files.append(img_path)
             img_paths.append((img_path, img_filename))
@@ -323,7 +312,6 @@ async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(Non
         if len(img_paths) == 1:
             single_path, single_name = img_paths[0]
             generated_files.remove(single_path)
-
             return {
                 "message": "Conversion successful",
                 "zip_filename": single_name,
@@ -333,70 +321,116 @@ async def convert_pdf_to_jpg(file: UploadFile = File(...), pages: str = Form(Non
             with zipfile.ZipFile(zip_path, "w") as zipf:
                 for p_path, p_name in img_paths:
                     zipf.write(p_path, arcname=p_name)
-
             return {
                 "message": "Conversion successful",
                 "zip_filename": zip_filename,
                 "download_url": f"/download/{zip_filename}",
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error converting PDF to JPG: {e}")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
     finally:
         for path in generated_files:
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                os.remove(path)
             except Exception:
                 pass
-
         try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
+            os.remove(input_path)
         except Exception:
             pass
 
 
+# ──────────────────── IMAGES → PDF ────────────────────────────
+
+@app.post("/convert/images-to-pdf/")
+async def images_to_pdf(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Please upload at least one image.")
+
+    task_id = str(uuid.uuid4())
+    temp_files = []
+    output_filename = f"images_to_pdf_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    try:
+        doc = fitz.open()
+
+        for file in files:
+            if not is_valid_image(file.content_type or ""):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{file.filename} is not a supported image (JPEG, PNG, GIF, WebP, BMP).",
+                )
+            data = await read_file_bytes(file)
+            ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+            temp_path = os.path.join(UPLOAD_DIR, f"{task_id}_{uuid.uuid4()}{ext}")
+            with open(temp_path, "wb") as f:
+                f.write(data)
+            temp_files.append(temp_path)
+
+            img_doc = fitz.open(temp_path)
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+
+            img_pdf = fitz.open("pdf", pdf_bytes)
+            doc.insert_pdf(img_pdf)
+            img_pdf.close()
+
+        doc.save(output_path)
+        doc.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    finally:
+        for path in temp_files:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    return {
+        "message": "Images converted to PDF successfully",
+        "output_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── PROTECT ──────────────────────────────
+
 @app.post("/protect/")
 async def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-
-    if not password:
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+    if not password.strip():
         raise HTTPException(status_code=400, detail="Password is required.")
 
     task_id = str(uuid.uuid4())
-    input_filename = f"protect_input_{task_id}.pdf"
-    input_path = os.path.join(UPLOAD_DIR, input_filename)
-
-    try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
-
+    input_path = os.path.join(UPLOAD_DIR, f"protect_input_{task_id}.pdf")
     protected_filename = f"protected_{task_id}.pdf"
     protected_path = os.path.join(UPLOAD_DIR, protected_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
 
     try:
         reader = PdfReader(input_path)
         writer = PdfWriter()
-
         for page in reader.pages:
             writer.add_page(page)
-
         writer.encrypt(password)
-
-        with open(protected_path, "wb") as f_out:
-            writer.write(f_out)
-
+        with open(protected_path, "wb") as f:
+            writer.write(f)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Protection failed: {str(e)}")
     finally:
         try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
+            os.remove(input_path)
         except Exception:
             pass
 
@@ -407,45 +441,84 @@ async def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
     }
 
 
-@app.post("/compress/")
-async def compress_pdf(file: UploadFile = File(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+# ─────────────────────── UNLOCK ───────────────────────────────
+
+@app.post("/unlock/")
+async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
 
     task_id = str(uuid.uuid4())
-    input_filename = f"compress_input_{task_id}.pdf"
-    input_path = os.path.join(UPLOAD_DIR, input_filename)
+    input_path = os.path.join(UPLOAD_DIR, f"unlock_input_{task_id}.pdf")
+    output_filename = f"unlocked_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
+        reader = PdfReader(input_path)
+        if reader.is_encrypted:
+            result = reader.decrypt(password)
+            if not result:
+                raise HTTPException(status_code=401, detail="Incorrect password.")
 
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        with open(output_path, "wb") as f:
+            writer.write(f)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unlock failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    return {
+        "message": "PDF unlocked successfully",
+        "output_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── COMPRESS ─────────────────────────────
+
+@app.post("/compress/")
+async def compress_pdf(file: UploadFile = File(...)):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"compress_input_{task_id}.pdf")
     compressed_filename = f"compressed_{task_id}.pdf"
     compressed_path = os.path.join(UPLOAD_DIR, compressed_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
 
     try:
         reader = PdfReader(input_path)
         writer = PdfWriter()
-
         for page in reader.pages:
             writer.add_page(page)
-
         for page in writer.pages:
             page.compress_content_streams()
-
         writer.compress_identical_objects()
-
-        with open(compressed_path, "wb") as f_out:
-            writer.write(f_out)
-
+        with open(compressed_path, "wb") as f:
+            writer.write(f)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Compression failed: {str(e)}")
     finally:
         try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
+            os.remove(input_path)
         except Exception:
             pass
 
@@ -454,3 +527,297 @@ async def compress_pdf(file: UploadFile = File(...)):
         "compressed_filename": compressed_filename,
         "download_url": f"/download/{compressed_filename}",
     }
+
+
+# ─────────────────────── WATERMARK ────────────────────────────
+
+@app.post("/watermark/")
+async def add_watermark(
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    opacity: float = Form(0.3),
+):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Watermark text is required.")
+
+    opacity = max(0.1, min(1.0, opacity))
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"wm_input_{task_id}.pdf")
+    output_filename = f"watermarked_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
+
+    try:
+        doc = fitz.open(input_path)
+        for page in doc:
+            rect = page.rect
+            page.insert_text(
+                fitz.Point(rect.width / 2 - 100, rect.height / 2),
+                text,
+                fontsize=48,
+                color=(0.7, 0.7, 0.7),
+                rotate=45,
+                overlay=True,
+            )
+        doc.save(output_path)
+        doc.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Watermark failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    return {
+        "message": "Watermark added successfully",
+        "watermarked_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── ROTATE ───────────────────────────────
+
+@app.post("/rotate/")
+async def rotate_pdf(
+    file: UploadFile = File(...),
+    angle: int = Form(...),
+    pages: str = Form(None),
+):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+    if angle not in (90, 180, 270):
+        raise HTTPException(status_code=400, detail="Angle must be 90, 180, or 270.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"rot_input_{task_id}.pdf")
+    output_filename = f"rotated_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+        writer = PdfWriter()
+
+        selected = set()
+        if pages:
+            for p in pages.split(","):
+                p = p.strip()
+                if p.isdigit():
+                    idx = int(p) - 1
+                    if 0 <= idx < total_pages:
+                        selected.add(idx)
+        if not selected:
+            selected = set(range(total_pages))
+
+        for i, page in enumerate(reader.pages):
+            if i in selected:
+                page.rotate(angle)
+            writer.add_page(page)
+
+        with open(output_path, "wb") as f:
+            writer.write(f)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rotation failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    return {
+        "message": f"Rotation by {angle}° successful",
+        "rotated_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── DELETE PAGES ─────────────────────────
+
+@app.post("/delete-pages/")
+async def delete_pages(
+    file: UploadFile = File(...),
+    pages: str = Form(...),
+):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"del_input_{task_id}.pdf")
+    output_filename = f"deleted_pages_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+
+        to_delete = set()
+        for p in pages.split(","):
+            p = p.strip()
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < total_pages:
+                    to_delete.add(idx)
+
+        if not to_delete:
+            raise HTTPException(status_code=400, detail="No valid page numbers provided.")
+        if len(to_delete) >= total_pages:
+            raise HTTPException(status_code=400, detail="Cannot delete all pages from a PDF.")
+
+        writer = PdfWriter()
+        for i, page in enumerate(reader.pages):
+            if i not in to_delete:
+                writer.add_page(page)
+
+        with open(output_path, "wb") as f:
+            writer.write(f)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Page deletion failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    return {
+        "message": f"Deleted {len(to_delete)} page(s) successfully",
+        "output_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── REORDER PAGES ────────────────────────
+
+@app.post("/reorder-pages/")
+async def reorder_pages(
+    file: UploadFile = File(...),
+    order: str = Form(...),
+):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"reorder_input_{task_id}.pdf")
+    output_filename = f"reordered_{task_id}.pdf"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+
+        new_order = []
+        for p in order.split(","):
+            p = p.strip()
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < total_pages:
+                    new_order.append(idx)
+
+        if not new_order:
+            raise HTTPException(status_code=400, detail="No valid page order provided.")
+
+        writer = PdfWriter()
+        for idx in new_order:
+            writer.add_page(reader.pages[idx])
+
+        with open(output_path, "wb") as f:
+            writer.write(f)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reorder failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    return {
+        "message": "Pages reordered successfully",
+        "output_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+    }
+
+
+# ─────────────────────── EXTRACT TEXT ─────────────────────────
+
+@app.post("/extract-text/")
+async def extract_text(file: UploadFile = File(...)):
+    data = await read_file_bytes(file)
+    if not is_valid_pdf(data):
+        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+
+    task_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"txt_input_{task_id}.pdf")
+    output_filename = f"text_{task_id}.txt"
+    output_path = os.path.join(UPLOAD_DIR, output_filename)
+
+    with open(input_path, "wb") as f:
+        f.write(data)
+
+    full_text = ""
+    try:
+        doc = fitz.open(input_path)
+        parts = []
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            if text.strip():
+                parts.append(f"--- Page {i + 1} ---\n{text}")
+        doc.close()
+        full_text = "\n\n".join(parts)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
+    finally:
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    preview = full_text[:500] + "..." if len(full_text) > 500 else full_text
+
+    return {
+        "message": "Text extracted successfully",
+        "output_filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+        "preview": preview,
+    }
+
+
+# ─────────────────────── DOWNLOAD ─────────────────────────────
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, filename=safe_filename)
