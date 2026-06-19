@@ -101,6 +101,8 @@ async def upload_file(file: UploadFile = File(...)):
     return {
         "filename": file.filename,
         "file_id": file_id,
+        "content_type": file.content_type,
+        "path": file_path,
         "message": "File uploaded successfully",
         "download_url": f"/download/{file_id}{ext}",
     }
@@ -234,18 +236,36 @@ async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
 # ─────────────────────── PDF → WORD ───────────────────────────
 
 @app.post("/convert/pdf-to-word/")
-async def convert_pdf_to_word(file: UploadFile = File(...)):
-    data = await read_file_bytes(file)
-    if not is_valid_pdf(data):
-        raise HTTPException(status_code=400, detail="Invalid PDF file.")
+async def convert_pdf_to_word(
+    file_id: str = Form(None),
+    file: UploadFile = File(None),
+):
+    """Accepts either a previously uploaded file_id OR a direct file upload."""
+    pdf_path = None
+    temp_created = False
+
+    if file_id:
+        # Legacy mode: look up previously uploaded file by file_id
+        files = os.listdir(UPLOAD_DIR)
+        target = next((f for f in files if f.startswith(file_id) and f.endswith(".pdf")), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="File not found.")
+        pdf_path = os.path.join(UPLOAD_DIR, target)
+    elif file:
+        data = await read_file_bytes(file)
+        if not is_valid_pdf(data):
+            raise HTTPException(status_code=400, detail="Invalid PDF file.")
+        task_id = str(uuid.uuid4())
+        pdf_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(data)
+        temp_created = True
+    else:
+        raise HTTPException(status_code=400, detail="Provide file_id or upload a file.")
 
     task_id = str(uuid.uuid4())
-    pdf_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
     docx_filename = f"word_{task_id}.docx"
     docx_path = os.path.join(UPLOAD_DIR, docx_filename)
-
-    with open(pdf_path, "wb") as f:
-        f.write(data)
 
     try:
         cv = Converter(pdf_path)
@@ -254,10 +274,11 @@ async def convert_pdf_to_word(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
     finally:
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
+        if temp_created and pdf_path:
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
 
     return {
         "message": "Conversion successful",
