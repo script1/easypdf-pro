@@ -237,15 +237,14 @@ async def split_pdf(file: UploadFile = File(...), pages: str = Form(None)):
 
 @app.post("/convert/pdf-to-word/")
 async def convert_pdf_to_word(
-    file_id: str = Form(None),
+    file_id: str = None,
     file: UploadFile = File(None),
 ):
-    """Accepts either a previously uploaded file_id OR a direct file upload."""
+    """Accepts file_id as query param (legacy) OR a direct file upload."""
     pdf_path = None
     temp_created = False
 
     if file_id:
-        # Legacy mode: look up previously uploaded file by file_id
         files = os.listdir(UPLOAD_DIR)
         target = next((f for f in files if f.startswith(file_id) and f.endswith(".pdf")), None)
         if not target:
