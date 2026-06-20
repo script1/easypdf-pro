@@ -79,10 +79,6 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-def read_root():
-    return {"message": "EasyPDF Pro Backend is Running", "version": "2.0"}
-
 
 # ─────────────────────────── UPLOAD ───────────────────────────
 
